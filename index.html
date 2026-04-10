@@ -42,16 +42,13 @@
     <h2>Paste your HubSpot HTML here</h2>
     <textarea id="inp" placeholder="Paste the full exported HTML from HubSpot…" spellcheck="false"></textarea>
     <div class="options">
-      <label class="toggle"><input type="checkbox" id="opt-strict"     checked> Strict mode</label>
-      <label class="toggle"><input type="checkbox" id="opt-wrappers"   checked> Strip HubSpot wrappers</label>
-      <label class="toggle"><input type="checkbox" id="opt-responsive" checked> Remove responsive CSS</label>
+      <label class="toggle"><input type="checkbox" id="opt-strict" checked> Strict mode</label>
     </div>
     <div class="row">
       <button class="btn btn-primary" id="btn-convert">Convert</button>
       <span class="status" id="status"></span>
     </div>
   </div>
-
   <div class="panel">
     <h2>eLead-safe HTML</h2>
     <textarea id="out" readonly placeholder="Output will appear here…" spellcheck="false"></textarea>
@@ -64,27 +61,87 @@
 </main>
 
 <script>
-// ─────────────────────────────────────────────────────────────────────────────
-// CONVERTER  (runs entirely in-browser using DOMParser / HTMLElement APIs)
-// ─────────────────────────────────────────────────────────────────────────────
+'use strict';
+// ─── UTILITIES ────────────────────────────────────────────────────────────────
+
+// HTML-escape for attribute values and text
+function esc(s) {
+  return (s || '').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// Get inline style property from element
+function gStyle(el, prop) {
+  if (!el) return '';
+  const m = new RegExp('(?:^|;)\\s*' + prop.replace('-','\\-') + '\\s*:\\s*([^;]+)', 'i').exec(el.getAttribute('style') || '');
+  return m ? m[1].trim() : '';
+}
+
+// Get background color from element (style or bgcolor attr)
+function getBg(el) {
+  if (!el) return '';
+  return gStyle(el, 'background-color') || el.getAttribute('bgcolor') || '';
+}
+
+// Normalise a colour string to uppercase hex if possible
+function upColor(c) {
+  return (c || '').trim().toUpperCase();
+}
+
+// Strip span wrappers and ** markdown; convert <br> → <br />;
+// return the cleaned innerHTML
+function cleanInnerHTML(el) {
+  const clone = el.cloneNode(true);
+  // strip spans (hoist text)
+  for (const s of [...clone.querySelectorAll('span')]) {
+    const p = s.parentNode;
+    while (s.firstChild) p.insertBefore(s.firstChild, s);
+    p.removeChild(s);
+  }
+  // strip strong/b but keep text
+  for (const s of [...clone.querySelectorAll('strong, b')]) {
+    const p = s.parentNode;
+    while (s.firstChild) p.insertBefore(s.firstChild, s);
+    p.removeChild(s);
+  }
+  let h = clone.innerHTML;
+  h = h.replace(/\*\*([\s\S]*?)\*\*/g, '$1');           // strip **markdown**
+  h = h.replace(/\s*<br\s*\/?>/gi, '<br />');            // normalise <br>
+  h = h.replace(/\s+data-start="\d+"/g, '');
+  h = h.replace(/\s+data-end="\d+"/g, '');
+  return h.trim();
+}
+
+// Get the first explicit colour from any descendant span style="color:…"
+function spanColor(el) {
+  for (const s of el.querySelectorAll('[style*="color"]')) {
+    const c = gStyle(s, 'color');
+    if (c && c !== 'inherit') return c;
+  }
+  return '';
+}
+
+// Parse HTML string to Document
+function parseDoc(html) {
+  return new DOMParser().parseFromString(html, 'text/html');
+}
+
+// ─── HUBL PRESERVATION ───────────────────────────────────────────────────────
 
 function extractHubl(html) {
   const tokens = [];
-  const escaped = html.replace(/(\{%[\s\S]*?%\}|\{\{[\s\S]*?\}\})/g, (m) => {
+  const out = html.replace(/(\{%[\s\S]*?%\}|\{\{[\s\S]*?\}\})/g, m => {
     tokens.push(m);
     return `__HUBL_${tokens.length - 1}__`;
   });
-  return { escaped, tokens };
+  return { out, tokens };
 }
 function restoreHubl(html, tokens) {
   return html.replace(/__HUBL_(\d+)__/g, (_, i) => tokens[+i]);
 }
 
-function parse(html) {
-  return new DOMParser().parseFromString(html, 'text/html');
-}
+// ─── IMAGE → ANCHOR MAP ───────────────────────────────────────────────────────
 
-function buildImageAnchorMap(doc) {
+function buildAnchorMap(doc) {
   const map = new Map();
   for (const a of doc.querySelectorAll('a[href]')) {
     for (const img of a.querySelectorAll('img[src]')) {
@@ -94,107 +151,505 @@ function buildImageAnchorMap(doc) {
   return map;
 }
 
-function unwrapHubspotWrappers(doc) {
-  const safe = new Set(['div','span','section']);
-  for (const el of [...doc.querySelectorAll('.hs_cos_wrapper, .hse-section, [class*="hs-cos-wrapper"]')]) {
-    if (!safe.has(el.tagName.toLowerCase())) continue;
-    const p = el.parentNode;
-    while (el.firstChild) p.insertBefore(el.firstChild, el);
-    p.removeChild(el);
-  }
+// ─── VALIDATION ───────────────────────────────────────────────────────────────
+
+function suspiciousLinks(hrefs) {
+  return hrefs.flatMap(href => {
+    const w = [];
+    if (/\.com\.com/i.test(href))                  w.push({ href, reason: 'contains .com.com' });
+    if (/www\.\./i.test(href))                     w.push({ href, reason: 'contains www..' });
+    if (/\.(jpg|png|webp|gif)$/i.test(href))       w.push({ href, reason: 'ends with image extension' });
+    if (/(hs-fs\/hubfs|hs-sites)/i.test(href))     w.push({ href, reason: 'contains HubSpot file host' });
+    return w;
+  });
 }
 
-function removeHsAttributes(doc) {
-  for (const el of doc.querySelectorAll('*')) {
-    for (const attr of [...el.attributes]) {
-      if (/^data-hs-/i.test(attr.name)) el.removeAttribute(attr.name);
-    }
-    if (el.className && typeof el.className === 'string') {
-      const cleaned = el.className.split(/\s+/).filter(c => !/^hs[_-]|^hse-|^hs-/i.test(c)).join(' ').trim();
-      cleaned ? el.setAttribute('class', cleaned) : el.removeAttribute('class');
-    }
-  }
-}
+function validate(anchorMap, outDoc) {
+  const errors = [], warnings = [];
+  const allHrefs = [...outDoc.querySelectorAll('a[href]')].map(a => a.getAttribute('href'));
+  warnings.push(...suspiciousLinks(allHrefs));
 
-function extractMediaBlocks(css) {
-  const blocks = [];
-  let i = 0;
-  while (i < css.length) {
-    const at = css.indexOf('@media', i);
-    if (at === -1) break;
-    let open = css.indexOf('{', at);
-    if (open === -1) break;
-    let depth = 0, end = open;
-    for (; end < css.length; end++) {
-      if (css[end] === '{') depth++;
-      else if (css[end] === '}') { depth--; if (depth === 0) break; }
-    }
-    blocks.push({ start: at, end: end + 1, text: css.slice(at, end + 1) });
-    i = end + 1;
-  }
-  return blocks;
-}
-const STACK_PATTERNS = [/\.hse-column\b/,/\.hse-column-container\b/,/\.hse-no-stack-row\b/,/display\s*:\s*block/,/display\s*:\s*table/];
-function stripResponsiveCSS(doc) {
-  for (const style of doc.querySelectorAll('style')) {
-    let css = style.textContent;
-    const blocks = extractMediaBlocks(css);
-    for (let b = blocks.length - 1; b >= 0; b--) {
-      const { start, end, text } = blocks[b];
-      if (/prefers-color-scheme\s*:\s*dark/i.test(text)) continue;
-      if (STACK_PATTERNS.some(p => p.test(text))) css = css.slice(0, start) + css.slice(end);
-    }
-    style.textContent = css;
-  }
-}
-
-function lockImageWidths(doc) {
-  for (const img of doc.querySelectorAll('img')) {
-    const w = img.getAttribute('width') || (img.style.width || '').replace('px','');
-    if (w && !isNaN(parseInt(w))) {
-      const px = parseInt(w);
-      img.setAttribute('width', px);
-      img.style.width = px + 'px';
-    }
-    if (!img.style.display) img.style.display = 'block';
-    if (!img.getAttribute('height')) img.setAttribute('height', 'auto');
-  }
-}
-
-function enforce600(doc) {
-  for (const table of doc.querySelectorAll('table')) {
-    if (!table.closest('table > * table')) {
-      const w = table.getAttribute('width');
-      if (!w || parseInt(w) >= 550) {
-        table.setAttribute('width', '600');
-        table.style.width = '600px';
-        if (!table.style.maxWidth) table.style.maxWidth = '600px';
+  for (const [src, expectedHref] of anchorMap) {
+    for (const img of outDoc.querySelectorAll('img')) {
+      if (img.getAttribute('src') !== src) continue;
+      const p = img.parentElement;
+      if (!p || p.tagName.toLowerCase() !== 'a') {
+        errors.push({ src, issue: 'image lost its anchor tag' }); continue;
       }
-      break;
+      const actual = p.getAttribute('href');
+      if (actual !== expectedHref) errors.push({ src, expected: expectedHref, actual, issue: 'href changed' });
+      if (actual === src && expectedHref !== src) errors.push({ src, issue: 'image auto-linked to its own src' });
     }
+  }
+  for (const img of outDoc.querySelectorAll('img')) {
+    const src = img.getAttribute('src');
+    if (anchorMap.has(src)) continue;
+    const p = img.parentElement;
+    if (p && p.tagName.toLowerCase() === 'a' && p.getAttribute('href') === src)
+      errors.push({ src, issue: 'image auto-wrapped with its own src (not linked in input)' });
+  }
+  return { errors, warnings, passed: errors.length === 0 };
+}
+
+// ─── PREHEADER ────────────────────────────────────────────────────────────────
+
+function getPreheader(doc) {
+  const el = doc.querySelector('#preview_text');
+  if (!el) return '';
+  // Strip zero-width joiners, soft-hyphens, non-breaking-spaces used as padding
+  return el.textContent
+    .replace(/[\u034F\u00AD\u200B-\u200D\uFEFF\u00A0]+/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+// ─── EXTRACTORS ───────────────────────────────────────────────────────────────
+
+function getHseSize(col) {
+  for (const cls of col.className.split(/\s+/)) {
+    const m = /^hse-size-(\d+)$/.exec(cls);
+    if (m) return +m[1];
+  }
+  return 12;
+}
+
+// Extract data from an hse-image-wrapper (or any element containing a/img)
+function extractImage(el) {
+  const imgTd = el.querySelector('td[style*="padding"]');
+  const a   = el.querySelector('a[href]');
+  const img = el.querySelector('img[src]');
+  if (!img) return null;
+  const src     = img.getAttribute('src') || '';
+  const alt     = img.getAttribute('alt') || '';
+  const width   = img.getAttribute('width') || '600';
+  const href    = a ? a.getAttribute('href') : null;
+  let   padding = '0';
+  if (imgTd) {
+    const p = gStyle(imgTd, 'padding');
+    if (p && !/^0(px)?$/.test(p.trim())) padding = p;
+  }
+  return { src, alt, width, href, padding };
+}
+
+// Extract divider data from a <p style="border-top…">
+function extractDivider(p) {
+  const s = p.getAttribute('style') || '';
+  const bm = /border-top\s*:\s*([^;]+)/i.exec(s);
+  const wm = /width\s*:\s*([^;]+)/i.exec(s);
+  return {
+    border: bm ? bm[1].trim() : '1px solid #000000',
+    width:  wm ? wm[1].trim() : '100%',
+  };
+}
+
+// Determine if a rich-text wrapper has "heading" characteristics (large font / centred)
+function isHeadingEl(el) {
+  const tag = el.tagName.toLowerCase();
+  if (tag === 'h1' || tag === 'h2' || tag === 'h3') return true;
+  const fs = parseFloat(gStyle(el, 'font-size'));
+  return fs >= 18;
+}
+
+// Extract text module data from a hs_cos_wrapper div
+function extractText(wrapper) {
+  const richDiv = wrapper.querySelector('[data-hs-cos-type="rich_text"]') || wrapper;
+
+  // All block elements with actual text content
+  const elems = [...richDiv.querySelectorAll('h1,h2,h3,p,div')]
+    .filter(el => {
+      // only direct-ish children — skip elements that are deeply nested
+      const txt = el.textContent.replace(/[\u00A0\s]/g, '');
+      return txt.length > 0;
+    })
+    // De-duplicate: skip if a parent is also in the list
+    .filter((el, _, arr) => !arr.some(o => o !== el && o.contains(el)));
+
+  if (!elems.length) return null;
+
+  // Get dominant colour
+  const color = upColor(spanColor(richDiv) || '#FFFFFF');
+
+  // Check if these are all large / centred headings
+  const allCentered = elems.every(el => {
+    const ta = gStyle(el, 'text-align') || el.getAttribute('align') || '';
+    return ta === 'center';
+  });
+
+  // Multi-heading: ≥2 elements, large font, all centred
+  if (elems.length > 1 && allCentered && elems.every(el => isHeadingEl(el))) {
+    const items = elems.map(el => ({
+      text:       cleanInnerHTML(el),
+      fontSize:   gStyle(el, 'font-size')   || '22px',
+      lineHeight: gStyle(el, 'line-height') || '175%',
+      fontWeight: 'bold',
+      color,
+    }));
+    return { type: 'multi-heading', items, textAlign: 'center', color };
+  }
+
+  // Single heading
+  const first = elems[0];
+  if (elems.length === 1 && isHeadingEl(first)) {
+    const ta = gStyle(first, 'text-align') || first.getAttribute('align') || '';
+    return {
+      type:       'heading',
+      text:       cleanInnerHTML(first),
+      fontSize:   gStyle(first, 'font-size')   || '22px',
+      lineHeight: gStyle(first, 'line-height') || '175%',
+      fontWeight: gStyle(first, 'font-weight') || 'bold',
+      textAlign:  ta,
+      color,
+    };
+  }
+
+  // Body copy: multiple paragraphs (or single small-font paragraph)
+  const parts = elems.map(el => {
+    const txt = el.textContent.replace(/[\u00A0]/g, '').trim();
+    if (!txt) return null;
+    return cleanInnerHTML(el);
+  }).filter(Boolean);
+
+  if (!parts.length) return null;
+
+  const fontSize   = gStyle(first, 'font-size')   || '14px';
+  const lineHeight = gStyle(first, 'line-height') || '175%';
+  const fontWeight = gStyle(first, 'font-weight') || 'normal';
+  const textAlign  = gStyle(first, 'text-align')  || '';
+
+  if (parts.length > 1) {
+    return { type: 'body', parts, fontSize, lineHeight, fontWeight, textAlign, color };
+  }
+
+  return { type: 'text', text: parts[0], fontSize, lineHeight, fontWeight, textAlign, color };
+}
+
+// ─── ROW BUILDERS ─────────────────────────────────────────────────────────────
+
+function rowImage(d, bg) {
+  const { src, alt, width, href, padding } = d;
+  const isZero = /^0(px)?(\s+0(px)?)*$/.test((padding || '0').trim());
+  const padStyle = isZero ? 'padding:0; font-size:0;' : `padding:${padding};`;
+  const imgStyle = `display:block; border:0; outline:none; text-decoration:none; width:${width}px; height:auto; max-width:${width}px;`;
+  const inner = href
+    ? `<a href="${esc(href)}" target="_blank" style="text-decoration:none;">\n                <img src="${esc(src)}" width="${width}" alt="${esc(alt)}" style="${imgStyle}" />\n              </a>`
+    : `<img src="${esc(src)}" width="${width}" alt="${esc(alt)}" style="${imgStyle}" />`;
+  return `
+          <tr>
+            <td align="center" style="background-color:${bg}; ${padStyle}">
+              ${inner}
+            </td>
+          </tr>`;
+}
+
+function rowDivider(d, bg) {
+  const { border, width } = d;
+  if (/^100/.test(width)) {
+    return `
+          <tr>
+            <td style="background-color:${bg}; padding:3px 20px 5px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;">
+                <tr>
+                  <td style="border-top:${border}; font-size:1px; line-height:1px;">&nbsp;</td>
+                </tr>
+              </table>
+            </td>
+          </tr>`;
+  }
+  const pct = parseFloat(width) / 100;
+  const w   = Math.round(560 * pct); // 560 = 600 - 2×20px padding
+  return `
+          <tr>
+            <td style="background-color:${bg}; padding:10px 20px;">
+              <table role="presentation" align="center" width="${w}" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse; width:${w}px;">
+                <tr>
+                  <td style="border-top:${border}; font-size:1px; line-height:1px;">&nbsp;</td>
+                </tr>
+              </table>
+            </td>
+          </tr>`;
+}
+
+function rowText(d, bg) {
+  if (!d) return '';
+  const { type, color, textAlign } = d;
+  const taStyle = textAlign === 'center' ? ' text-align:center;' : '';
+
+  if (type === 'multi-heading') {
+    const outerTd = `background-color:${bg}; padding:10px 20px; font-family:Arial, Helvetica, sans-serif;${taStyle}`;
+    const divs = d.items.map(it => {
+      const fw = it.fontWeight && it.fontWeight !== 'normal' ? ` font-weight:${it.fontWeight};` : '';
+      return `              <div style="font-size:${it.fontSize}; line-height:${it.lineHeight};${fw} color:${it.color};">\n                ${it.text}\n              </div>`;
+    }).join('\n');
+    return `
+          <tr>
+            <td style="${outerTd}">
+${divs}
+            </td>
+          </tr>`;
+  }
+
+  if (type === 'body') {
+    const outerTd = `background-color:${bg}; padding:10px 20px; font-family:Arial, Helvetica, sans-serif; color:${color};${taStyle}`;
+    const divStyle = `font-size:${d.fontSize}; line-height:${d.lineHeight}; color:${color};`;
+    const html = d.parts.join('<br /><br />\n                ');
+    return `
+          <tr>
+            <td style="${outerTd}">
+              <div style="${divStyle}">
+                ${html}
+              </div>
+            </td>
+          </tr>`;
+  }
+
+  // heading or text
+  const outerTd = `background-color:${bg}; padding:10px 20px; font-family:Arial, Helvetica, sans-serif; color:${color};${taStyle}`;
+  const fw      = d.fontWeight && d.fontWeight !== 'normal' ? ` font-weight:${d.fontWeight};` : '';
+  const divStyle = `font-size:${d.fontSize}; line-height:${d.lineHeight};${fw} color:${color};${taStyle}`;
+  return `
+          <tr>
+            <td style="${outerTd}">
+              <div style="${divStyle}">
+                ${d.text}
+              </div>
+            </td>
+          </tr>`;
+}
+
+function rowButtons(columns, bg) {
+  const cells = columns.map(col => {
+    const size  = getHseSize(col);
+    const width = Math.round(600 / 12 * size);
+
+    // Find button table: table with border-collapse:separate
+    const btnTable = col.querySelector('table[style*="separate"]');
+    if (!btnTable) return `<td width="${width}" style="width:${width}px;"></td>`;
+
+    const a       = btnTable.querySelector('a[href]');
+    const btnTd   = btnTable.querySelector('td[bgcolor], td[style*="background-color"]');
+    if (!a || !btnTd) return `<td width="${width}" style="width:${width}px;"></td>`;
+
+    const href        = a.getAttribute('href') || '';
+    const text        = a.textContent.replace(/\s+/g, ' ').trim();
+    const border      = gStyle(btnTd, 'border')     || '5px solid #FFFFFF';
+    const msoPad      = gStyle(btnTd, 'mso-padding-alt') || '12px 22px';
+    const dispPad     = msoPad;
+    const fs          = gStyle(a,     'font-size')   || '18px';
+    const btnBg       = gStyle(btnTd, 'background-color') || btnTd.getAttribute('bgcolor') || bg;
+
+    return `
+                  <td align="center" valign="middle" width="${width}" style="width:${width}px; padding:10px; background-color:${bg};">
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse:separate;">
+                      <tr>
+                        <td align="center" bgcolor="${btnBg}" style="background-color:${btnBg}; border:${border}; mso-padding-alt:${dispPad};">
+                          <a href="${esc(href)}" target="_blank" style="display:block; padding:${dispPad}; font-family:Arial, Helvetica, sans-serif; font-size:${fs}; line-height:${fs}; color:#FFFFFF; font-weight:bold; text-decoration:none;">
+                            ${esc(text)}
+                          </a>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>`;
+  }).join('\n');
+
+  return `
+          <tr>
+            <td align="center" style="background-color:${bg};">
+              <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse; width:600px;">
+                <tr>
+                  ${cells}
+                </tr>
+              </table>
+            </td>
+          </tr>`;
+}
+
+function rowFooter(footerTable, bg) {
+  const td = footerTable.querySelector('td[align="center"]') || footerTable.querySelector('td');
+  if (!td) return '';
+
+  let nameHtml = '';
+  const lineHtmls = [];
+
+  for (const p of td.querySelectorAll('p')) {
+    const strong = p.querySelector('strong, span[style*="font-weight"]');
+    const link   = p.querySelector('a[href]');
+
+    if (strong && !nameHtml) {
+      nameHtml = esc(strong.textContent.trim());
+      continue;
+    }
+    if (link) {
+      const href  = link.getAttribute('href') || '';
+      const color = gStyle(link, 'color') || '#00A4BD';
+      lineHtmls.push(`<a href="${esc(href)}" style="color:${color}; text-decoration:underline;">${esc(link.textContent.trim())}</a>`);
+      continue;
+    }
+    const txt = p.textContent.replace(/\u00A0/g, '').trim();
+    if (txt) lineHtmls.push(esc(txt));
+  }
+
+  return `
+          <tr>
+            <td style="background-color:${bg}; padding:10px 20px; text-align:center; font-family:Arial, Helvetica, sans-serif; color:#23496D;">
+              <div style="font-size:12px; line-height:135%; color:#23496D;">
+                <strong>${nameHtml}</strong><br />
+                ${lineHtmls.join('<br />\n                ')}
+              </div>
+            </td>
+          </tr>`;
+}
+
+function rowSocial(socialModule, bg) {
+  // Collect unique <a href><img src> pairs
+  const seen  = new Set();
+  const links = [];
+  for (const a of socialModule.querySelectorAll('a[href]')) {
+    const img = a.querySelector('img[src]');
+    if (!img) continue;
+    const src = img.getAttribute('src') || '';
+    if (seen.has(src)) continue;
+    seen.add(src);
+    links.push({ href: a.getAttribute('href') || '', src, alt: img.getAttribute('alt') || '' });
+  }
+  if (!links.length) return '';
+
+  const cells = links.map(({ href, src, alt }) =>
+    `\n                  <td style="padding:8px 5px;">\n                    <a href="${esc(href)}" target="_blank" style="text-decoration:none;">\n                      <img src="${esc(src)}" alt="${esc(alt)}" height="25" style="display:block;border:0;height:25px;width:auto;" />\n                    </a>\n                  </td>`
+  ).join('');
+
+  return `
+          <tr>
+            <td style="background-color:${bg}; padding:10px 20px; text-align:center;">
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center" style="border-collapse:collapse;">
+                <tr>${cells}
+                </tr>
+              </table>
+            </td>
+          </tr>`;
+}
+
+// ─── MODULE DISPATCHER ────────────────────────────────────────────────────────
+
+function processModuleEl(el, bg, rows) {
+  const tag = el.tagName.toLowerCase();
+
+  // Direct hs_cos_wrapper div (image or social module)
+  if (tag === 'div') {
+    const imgW = el.querySelector('table.hse-image-wrapper');
+    if (imgW) { const d = extractImage(imgW); if (d) rows.push(rowImage(d, bg)); return; }
+    const soc = el.querySelector('.hs_cos_wrapper_type_social_module');
+    if (soc) { rows.push(rowSocial(soc, bg)); return; }
+    return;
+  }
+
+  // Wrapper table
+  if (tag === 'table') {
+    const paddedTd = el.querySelector('td.hs_padded');
+    if (!paddedTd) return;
+    const wrapper = paddedTd.querySelector('.hs_cos_wrapper');
+    if (!wrapper) return;
+
+    // Image module inside wrapper table
+    const imgW = wrapper.querySelector('table.hse-image-wrapper');
+    if (imgW) { const d = extractImage(imgW); if (d) rows.push(rowImage(d, bg)); return; }
+
+    // Divider
+    const divP = wrapper.querySelector('p[style*="border-top"]');
+    if (divP) { rows.push(rowDivider(extractDivider(divP), bg)); return; }
+
+    // Footer
+    const ftTable = wrapper.querySelector('table.hse-footer');
+    if (ftTable) { rows.push(rowFooter(ftTable, bg)); return; }
+
+    // Social
+    const soc = wrapper.querySelector('.hs_cos_wrapper_type_social_module');
+    if (soc) { rows.push(rowSocial(soc, bg)); return; }
+
+    // Text / heading
+    const td = rowText(extractText(wrapper), bg);
+    if (td) rows.push(td);
   }
 }
 
-function addDarkMode(doc) {
-  const head = doc.head;
-  if (!head) return;
-  for (const [name, content] of [['color-scheme','light only'],['supported-color-schemes','light']]) {
-    if (!head.querySelector(`meta[name="${name}"]`)) {
-      const m = doc.createElement('meta');
-      m.setAttribute('name', name);
-      m.setAttribute('content', content);
-      head.insertBefore(m, head.firstChild);
+function extractSectionRows(col, bg) {
+  const rows = [];
+  for (const child of col.children) {
+    const tag = child.tagName.toLowerCase();
+    if (tag === 'table' || (tag === 'div' && /hs_cos_wrapper/.test(child.className))) {
+      processModuleEl(child, bg, rows);
     }
   }
-  if (!head.querySelector('style[data-dark]')) {
-    const s = doc.createElement('style');
-    s.setAttribute('data-dark','1');
-    s.textContent = '@media (prefers-color-scheme:dark){body,table,td,div{color:inherit!important;background-color:inherit!important;}}';
-    head.appendChild(s);
-  }
+  return rows;
 }
 
-function reapplyMap(doc, map) {
+// ─── MAIN EXTRACTOR ───────────────────────────────────────────────────────────
+
+function extractRows(doc) {
+  const rows = [];
+
+  for (const section of doc.querySelectorAll('.hse-section')) {
+    const container = section.querySelector('.hse-column-container');
+    if (!container) continue;
+
+    const bg      = upColor(getBg(container)) || '#FFFFFF';
+    const columns = [...section.querySelectorAll('.hse-column')];
+    if (!columns.length) continue;
+
+    if (columns.length > 1) {
+      // Multi-column: button row
+      rows.push(rowButtons(columns, bg));
+    } else {
+      // Single column: one or many modules
+      rows.push(...extractSectionRows(columns[0], bg));
+    }
+  }
+
+  return rows;
+}
+
+// ─── EMAIL ASSEMBLER ──────────────────────────────────────────────────────────
+
+function assembleEmail(title, preheader, rows) {
+  return `<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional //EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en">
+<head>
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="x-apple-disable-message-reformatting" />
+  <meta name="color-scheme" content="light only" />
+  <meta name="supported-color-schemes" content="light" />
+  <title>${esc(title)}</title>
+</head>
+<body style="margin:0; padding:0; background-color:#FFFFFF;">
+  <!-- Preheader -->
+  <div style="display:none;font-size:1px;color:#FFFFFF;line-height:1px;max-height:0px;max-width:0px;opacity:0;overflow:hidden;">
+    ${esc(preheader)}
+  </div>
+
+  <!-- Full width wrapper -->
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse; background-color:#FFFFFF;">
+    <tr>
+      <td align="center" valign="top" style="padding:20px 10px; background-color:#FFFFFF;">
+
+        <!-- 600px container -->
+        <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse; width:600px; max-width:600px; background-color:#FFFFFF;">
+${rows.filter(Boolean).join('\n')}
+        </table>
+        <!-- /600px container -->
+
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+}
+
+// ─── RE-APPLY ANCHOR MAP (safety net) ────────────────────────────────────────
+
+function reapplyAnchorMap(html, map) {
+  if (!map.size) return html;
+  const doc = parseDoc(html);
   for (const [src, href] of map) {
     for (const img of doc.querySelectorAll('img')) {
       if (img.getAttribute('src') !== src) continue;
@@ -209,101 +664,75 @@ function reapplyMap(doc, map) {
       }
     }
   }
+  return '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional //EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">\n' + doc.documentElement.outerHTML;
 }
 
-function suspiciousHrefs(hrefs) {
-  return hrefs.flatMap(href => {
-    const w = [];
-    if (/\.com\.com/i.test(href))               w.push({ href, reason: 'contains .com.com' });
-    if (/www\.\./i.test(href))                  w.push({ href, reason: 'contains www..' });
-    if (/\.(jpg|png|webp|gif)$/i.test(href))    w.push({ href, reason: 'ends with image extension' });
-    if (/(hs-fs\/hubfs|hs-sites)/i.test(href))  w.push({ href, reason: 'contains HubSpot file host' });
-    return w;
-  });
-}
+// ─── MAIN CONVERT ─────────────────────────────────────────────────────────────
 
-function validate(inputMap, outDoc) {
-  const errors = [], warnings = [];
-  const allHrefs = [...outDoc.querySelectorAll('a[href]')].map(a => a.getAttribute('href'));
-  warnings.push(...suspiciousHrefs(allHrefs));
+function convert(html, strict) {
+  // 1. Preserve HubL
+  const { out: hublEscaped, tokens } = extractHubl(html);
 
-  for (const [src, expectedHref] of inputMap) {
-    for (const img of outDoc.querySelectorAll('img')) {
-      if (img.getAttribute('src') !== src) continue;
-      const p = img.parentElement;
-      if (!p || p.tagName.toLowerCase() !== 'a') {
-        errors.push({ src, issue: 'image lost its anchor tag' }); continue;
-      }
-      const actual = p.getAttribute('href');
-      if (actual !== expectedHref) errors.push({ src, expectedHref, actual, issue: 'href changed' });
-      if (actual === src && expectedHref !== src) errors.push({ src, issue: 'image auto-linked to its own src' });
-    }
-  }
-  for (const img of outDoc.querySelectorAll('img')) {
-    const src = img.getAttribute('src');
-    if (inputMap.has(src)) continue;
-    const p = img.parentElement;
-    if (p && p.tagName.toLowerCase() === 'a' && p.getAttribute('href') === src)
-      errors.push({ src, issue: 'image auto-wrapped with its own src (not linked in input)' });
-  }
-  return { errors, warnings, passed: errors.length === 0 };
-}
+  // 2. Strip conditional comments
+  const stripped = hublEscaped.replace(/<!--\[if[^\]]*\]>[\s\S]*?<!\[endif\]-->/gi, '');
 
-function convert(html, { strict, stripWrappers, removeResponsiveCSS }) {
-  const { escaped, tokens } = extractHubl(html);
+  // 3. Parse input
+  const inputDoc = parseDoc(stripped);
 
-  const inputDoc = parse(escaped);
-  const imageAnchorMap = buildImageAnchorMap(inputDoc);
+  // 4. Build anchor map
+  const anchorMap = buildAnchorMap(inputDoc);
 
-  const doc = parse(escaped);
-  if (stripWrappers)       unwrapHubspotWrappers(doc);
-  removeHsAttributes(doc);
-  if (removeResponsiveCSS) stripResponsiveCSS(doc);
-  lockImageWidths(doc);
-  enforce600(doc);
-  addDarkMode(doc);
-  reapplyMap(doc, imageAnchorMap);
+  // 5. Extract content
+  const title     = inputDoc.title || '';
+  const preheader = getPreheader(inputDoc);
+  const rows      = extractRows(inputDoc);
 
-  let output = '<!DOCTYPE html>\n' + doc.documentElement.outerHTML;
+  // 6. Assemble
+  let output = assembleEmail(title, preheader, rows);
+
+  // 7. Re-apply anchor map (safety net)
+  output = reapplyAnchorMap(output, anchorMap);
+
+  // 8. Restore HubL
   output = restoreHubl(output, tokens);
 
-  const outDoc = parse(output);
-  const validation = validate(imageAnchorMap, outDoc);
+  // 9. Validate
+  const outDoc     = parseDoc(output);
+  const validation = validate(anchorMap, outDoc);
 
   if (strict && !validation.passed) {
     const err = new Error('Strict validation failed');
     err.validation = validation;
     throw err;
   }
+
   return { output, validation };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// UI
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── UI ───────────────────────────────────────────────────────────────────────
 
 let lastOutput = '';
 
 function renderValidation(v) {
   if (!v) return '';
-  let html = '';
+  let h = '';
   if (v.errors.length === 0) {
-    html += `<div class="vbox pass">✔ All image link mappings preserved.</div>`;
+    h += `<div class="vbox pass">&#10004; All image link mappings preserved.</div>`;
   } else {
-    html += `<div class="vbox fail">✘ ${v.errors.length} validation error${v.errors.length>1?'s':''}<ul>`;
-    v.errors.forEach(e => html += `<li>${JSON.stringify(e)}</li>`);
-    html += `</ul></div>`;
+    h += `<div class="vbox fail">&#10008; ${v.errors.length} validation error${v.errors.length > 1 ? 's' : ''}<ul>`;
+    v.errors.forEach(e => { h += `<li>${JSON.stringify(e)}</li>`; });
+    h += `</ul></div>`;
   }
   if (v.warnings.length) {
-    html += `<div class="vbox warn">⚠ ${v.warnings.length} suspicious link${v.warnings.length>1?'s':''}<ul>`;
-    v.warnings.forEach(w => html += `<li>${w.href} — ${w.reason}</li>`);
-    html += `</ul></div>`;
+    h += `<div class="vbox warn">&#9888; ${v.warnings.length} suspicious link${v.warnings.length > 1 ? 's' : ''}<ul>`;
+    v.warnings.forEach(w => { h += `<li>${w.href} &mdash; ${w.reason}</li>`; });
+    h += `</ul></div>`;
   }
-  return html;
+  return h;
 }
 
 document.getElementById('btn-convert').addEventListener('click', () => {
-  const html = document.getElementById('inp').value.trim();
+  const html   = document.getElementById('inp').value.trim();
   const status = document.getElementById('status');
   if (!html) { status.textContent = 'Paste some HTML first.'; return; }
 
@@ -311,16 +740,13 @@ document.getElementById('btn-convert').addEventListener('click', () => {
   document.getElementById('vresults').innerHTML = '';
 
   try {
-    const result = convert(html, {
-      strict:              document.getElementById('opt-strict').checked,
-      stripWrappers:       document.getElementById('opt-wrappers').checked,
-      removeResponsiveCSS: document.getElementById('opt-responsive').checked,
-    });
+    const strict = document.getElementById('opt-strict').checked;
+    const result = convert(html, strict);
     lastOutput = result.output;
     document.getElementById('out').value = result.output;
-    document.getElementById('btn-copy').disabled = false;
+    document.getElementById('btn-copy').disabled     = false;
     document.getElementById('btn-download').disabled = false;
-    document.getElementById('vresults').innerHTML = renderValidation(result.validation);
+    document.getElementById('vresults').innerHTML    = renderValidation(result.validation);
     status.textContent = 'Done.';
   } catch (err) {
     status.textContent = 'Error: ' + err.message;
@@ -336,8 +762,8 @@ document.getElementById('btn-copy').addEventListener('click', () => {
 
 document.getElementById('btn-download').addEventListener('click', () => {
   const blob = new Blob([lastOutput], { type: 'text/html' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href     = URL.createObjectURL(blob);
   a.download = 'elead-email.html';
   a.click();
   URL.revokeObjectURL(a.href);
