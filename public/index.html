@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HTML+HubL → eLead Email Converter</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #f4f5f7; color: #1a1a2e; min-height: 100vh; }
+    header { background: #1a1a2e; color: #fff; padding: 1rem 2rem; display: flex; align-items: center; gap: 1rem; }
+    header h1 { font-size: 1.2rem; font-weight: 600; }
+    .badge { background: #4f46e5; color: #fff; font-size: 0.7rem; padding: 2px 8px; border-radius: 999px; }
+    main { max-width: 1400px; margin: 0 auto; padding: 1.5rem; display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+    @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+    .panel { background: #fff; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,.08); padding: 1.25rem; display: flex; flex-direction: column; gap: .75rem; }
+    .panel h2 { font-size: .95rem; font-weight: 600; color: #374151; }
+    textarea { width: 100%; height: 320px; resize: vertical; font-family: 'Courier New', monospace; font-size: .8rem; border: 1px solid #d1d5db; border-radius: 6px; padding: .6rem; outline: none; }
+    textarea:focus { border-color: #4f46e5; }
+    .options { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+    .toggle { display: flex; align-items: center; gap: .4rem; font-size: .85rem; cursor: pointer; }
+    .toggle input { accent-color: #4f46e5; width: 15px; height: 15px; }
+    .btn { padding: .55rem 1.25rem; border: none; border-radius: 6px; font-size: .9rem; font-weight: 600; cursor: pointer; }
+    .btn-primary { background: #4f46e5; color: #fff; }
+    .btn-primary:hover { background: #4338ca; }
+    .btn-primary:disabled { background: #a5b4fc; cursor: not-allowed; }
+    .btn-secondary { background: #f3f4f6; color: #374151; border: 1px solid #d1d5db; }
+    .btn-secondary:hover { background: #e5e7eb; }
+    .actions { display: flex; gap: .5rem; flex-wrap: wrap; }
+    .validation { border-radius: 6px; padding: .75rem; font-size: .82rem; line-height: 1.6; }
+    .validation.pass { background: #ecfdf5; border: 1px solid #6ee7b7; color: #065f46; }
+    .validation.fail { background: #fef2f2; border: 1px solid #fca5a5; color: #7f1d1d; }
+    .validation.warn { background: #fffbeb; border: 1px solid #fcd34d; color: #78350f; }
+    .validation ul { padding-left: 1.2rem; margin-top: .3rem; }
+    .validation li { font-family: monospace; font-size: .78rem; word-break: break-all; }
+    .status { font-size: .82rem; color: #6b7280; min-height: 1.2em; }
+    pre { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 6px; padding: .75rem; font-size: .78rem; overflow: auto; height: 320px; white-space: pre-wrap; word-break: break-all; }
+    #fullscreen-overlay { display:none; position:fixed; inset:0; background:#000a; z-index:100; align-items:center; justify-content:center; }
+    #fullscreen-overlay.active { display:flex; }
+    #fullscreen-box { background:#fff; border-radius:8px; width:90vw; max-width:900px; padding:1.25rem; display:flex; flex-direction:column; gap:.75rem; }
+    #fullscreen-box textarea { height:70vh; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>HTML+HubL → eLead Email Converter</h1>
+  <span class="badge">v1.0</span>
+</header>
+<main>
+  <!-- INPUT -->
+  <div class="panel">
+    <h2>Input HTML + HubL</h2>
+    <textarea id="input" placeholder="Paste your HubSpot exported HTML here…"></textarea>
+    <div class="options">
+      <label class="toggle"><input type="checkbox" id="opt-strict" checked> Strict Mode</label>
+      <label class="toggle"><input type="checkbox" id="opt-wrappers" checked> Strip HubSpot Wrappers</label>
+      <label class="toggle"><input type="checkbox" id="opt-responsive" checked> Remove Responsive CSS</label>
+    </div>
+    <div class="actions">
+      <button class="btn btn-primary" id="btn-convert">Convert</button>
+    </div>
+    <div class="status" id="status"></div>
+  </div>
+
+  <!-- OUTPUT -->
+  <div class="panel">
+    <h2>Output HTML</h2>
+    <pre id="output-pre"><!-- output will appear here --></pre>
+    <div class="actions">
+      <button class="btn btn-secondary" id="btn-copy" disabled>Copy</button>
+      <button class="btn btn-secondary" id="btn-download" disabled>Download .html</button>
+      <button class="btn btn-secondary" id="btn-expand" disabled>Expand</button>
+    </div>
+    <div id="validation-panel"></div>
+  </div>
+</main>
+
+<!-- Fullscreen overlay -->
+<div id="fullscreen-overlay">
+  <div id="fullscreen-box">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <strong>Output HTML</strong>
+      <button class="btn btn-secondary" id="btn-close-fs">Close</button>
+    </div>
+    <textarea id="fs-textarea" readonly></textarea>
+    <div class="actions">
+      <button class="btn btn-secondary" id="btn-fs-copy">Copy</button>
+      <button class="btn btn-secondary" id="btn-fs-download">Download .html</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let lastOutput = '';
+
+function renderValidation(v) {
+  if (!v) return '';
+  const errors = v.errors || [];
+  const warnings = v.warnings || [];
+  let html = '';
+  if (errors.length === 0) {
+    html += `<div class="validation pass">✔ Validation PASSED — all image link mappings preserved.</div>`;
+  } else {
+    html += `<div class="validation fail">✘ Validation FAILED (${errors.length} error${errors.length>1?'s':''})<ul>`;
+    for (const e of errors) html += `<li>${JSON.stringify(e)}</li>`;
+    html += `</ul></div>`;
+  }
+  if (warnings.length) {
+    html += `<div class="validation warn">⚠ ${warnings.length} suspicious link${warnings.length>1?'s':''}<ul>`;
+    for (const w of warnings) html += `<li>${w.href} — ${w.reason}</li>`;
+    html += `</ul></div>`;
+  }
+  return html;
+}
+
+document.getElementById('btn-convert').addEventListener('click', async () => {
+  const html = document.getElementById('input').value.trim();
+  if (!html) { document.getElementById('status').textContent = 'Paste some HTML first.'; return; }
+  const btn = document.getElementById('btn-convert');
+  btn.disabled = true;
+  document.getElementById('status').textContent = 'Converting…';
+  document.getElementById('validation-panel').innerHTML = '';
+
+  try {
+    const res = await fetch('/api/convert', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        html,
+        strict: document.getElementById('opt-strict').checked,
+        stripWrappers: document.getElementById('opt-wrappers').checked,
+        removeResponsiveCSS: document.getElementById('opt-responsive').checked,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      document.getElementById('status').textContent = 'Error: ' + (data.error || res.statusText);
+      document.getElementById('validation-panel').innerHTML = renderValidation(data.validation);
+      lastOutput = '';
+    } else {
+      lastOutput = data.output;
+      document.getElementById('output-pre').textContent = data.output;
+      document.getElementById('btn-copy').disabled = false;
+      document.getElementById('btn-download').disabled = false;
+      document.getElementById('btn-expand').disabled = false;
+      document.getElementById('status').textContent = 'Done.';
+      document.getElementById('validation-panel').innerHTML = renderValidation(data.validation);
+    }
+  } catch (e) {
+    document.getElementById('status').textContent = 'Request failed: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+document.getElementById('btn-copy').addEventListener('click', () => {
+  navigator.clipboard.writeText(lastOutput).then(() => {
+    document.getElementById('status').textContent = 'Copied to clipboard.';
+  });
+});
+
+function downloadHtml(content) {
+  const blob = new Blob([content], { type: 'text/html' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'elead-email.html';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+document.getElementById('btn-download').addEventListener('click', () => downloadHtml(lastOutput));
+
+document.getElementById('btn-expand').addEventListener('click', () => {
+  document.getElementById('fs-textarea').value = lastOutput;
+  document.getElementById('fullscreen-overlay').classList.add('active');
+});
+document.getElementById('btn-close-fs').addEventListener('click', () => {
+  document.getElementById('fullscreen-overlay').classList.remove('active');
+});
+document.getElementById('btn-fs-copy').addEventListener('click', () => {
+  navigator.clipboard.writeText(lastOutput);
+});
+document.getElementById('btn-fs-download').addEventListener('click', () => downloadHtml(lastOutput));
+</script>
+</body>
+</html>

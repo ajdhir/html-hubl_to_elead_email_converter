@@ -1,0 +1,34 @@
+{
+  "name": "html-hubl_to_elead_email_converter",
+  "version": "1.0.0",
+  "description": "",
+  "main": "src/server.js",
+  "bin": {
+    "email-convert": "./src/cli.js"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "jest tests/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ajdhir/html-hubl_to_elead_email_converter.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/ajdhir/html-hubl_to_elead_email_converter/issues"
+  },
+  "homepage": "https://github.com/ajdhir/html-hubl_to_elead_email_converter#readme",
+  "dependencies": {
+    "express": "^5.2.1",
+    "jsdom": "^20.0.3"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.29.0",
+    "@babel/preset-env": "^7.29.2",
+    "babel-jest": "^30.3.0",
+    "jest": "^30.3.0"
+  }
+}
